@@ -10,11 +10,22 @@ import os
 import time
 import diskcache
 from functools import lru_cache
+import gc  # Garbage collection for memory management
 import warnings
+import psutil  # For memory monitoring (if installed)
 warnings.filterwarnings('ignore')
 
-# Initialize caching
-cache = diskcache.Cache('./cache')
+# Initialize caching with larger size limit and improved settings
+cache = diskcache.Cache('./cache', size_limit=2e9)  # 2GB cache limit
+
+# Memory monitoring function
+def get_memory_usage():
+    try:
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        return f"{memory_info.rss / (1024 * 1024):.1f} MB"
+    except:
+        return "Memory info unavailable"
 
 # Create output directory if it doesn't exist
 output_dir = 'emotion_analysis_results'
@@ -23,9 +34,10 @@ if not os.path.exists(output_dir):
 
 print("Loading data from CSV file...")
 start_time = time.time()
+print(f"Initial memory usage: {get_memory_usage()}")
 
 # Load data more efficiently using chunking and dtype specification
-# First identify the most important columns to keep for analysis
+# First identify the most important columns to keep for analysis - only load what we need
 essential_columns = [
     'ITEST_id', 'skill', 'correct', 'startTime', 'timeTaken',
     'confidence(BORED)', 'confidence(CONCENTRATING)', 'confidence(CONFUSED)',
@@ -34,7 +46,7 @@ essential_columns = [
     'RES_FRUSTRATED', 'RES_OFFTASK', 'RES_GAMING'
 ]
 
-# Specify dtypes for faster loading
+# Specify dtypes for faster loading with optimal memory footprint
 dtypes = {
     'ITEST_id': 'category',
     'skill': 'category',
@@ -53,89 +65,238 @@ dtypes = {
     'RES_GAMING': 'float32'
 }
 
-# Use chunking to load the large file in parts
-chunk_size = 100000
-chunks = []
+# Use chunking to load the large file in parts with optimized parameters
+chunk_size = 200000  # Larger chunks = fewer I/O operations
+parquet_cache_path = os.path.join('cache', 'preprocessed_data.parquet')
+pickle_cache_path = os.path.join('cache', 'preprocessed_data.pkl')
 
-# Try to load cached data first
-cached_data_path = os.path.join('cache', 'preprocessed_data.pkl')
-if os.path.exists(cached_data_path):
-    print("Loading data from cache...")
-    df = pd.read_pickle(cached_data_path)
+# Try to load cached data first - preferring parquet for its efficiency
+if os.path.exists(parquet_cache_path):
+    print("Loading data from parquet cache...")
+    df = pd.read_parquet(parquet_cache_path)
+    print(f"Memory usage after loading: {get_memory_usage()}")
+elif os.path.exists(pickle_cache_path):
+    print("Loading data from pickle cache...")
+    df = pd.read_pickle(pickle_cache_path)
 else:
     print("Processing data in chunks...")
-    for chunk in pd.read_csv("student_log_2.csv", usecols=essential_columns, 
-                         dtype=dtypes, chunksize=chunk_size, low_memory=False):
+    chunks = []
+    
+    # Process in chunks with optimized reading parameters
+    for i, chunk in enumerate(pd.read_csv("student_log_2.csv", 
+                                        usecols=essential_columns, 
+                                        dtype=dtypes, 
+                                        chunksize=chunk_size, 
+                                        low_memory=True,  # Use low_memory=True for better memory usage
+                                        engine='c')):
         # Process each chunk
         chunks.append(chunk)
+        if i % 5 == 0:
+            print(f"Processed {i+1} chunks, memory usage: {get_memory_usage()}")
     
-    # Combine all chunks
-    df = pd.concat(chunks, ignore_index=True)
+    print("Combining chunks...")
+    # Combine all chunks - more efficient with concat and single operation
+    df = pd.concat(chunks, ignore_index=True, copy=False)
+    
+    # Free memory from chunks
+    del chunks
+    gc.collect()
+    print(f"Memory after chunk processing: {get_memory_usage()}")
     
     # Preprocessing
     print("Preprocessing data...")
     
-    # Convert Unix timestamp to datetime
+    # Convert Unix timestamp to datetime - more efficient conversion
     if 'startTime' in df.columns:
+        # More efficient datetime conversion
         df['datetime'] = pd.to_datetime(df['startTime'], unit='s')
         df['date'] = df['datetime'].dt.date
     
     # Create a sample for quick initial rendering (20% of data)
     df_sample = df.sample(frac=0.2, random_state=42)
     
-    # Save processed data to cache
+    # Save processed data to cache - using parquet for better performance
+    print("Saving preprocessed data to cache...")
     os.makedirs('cache', exist_ok=True)
-    df.to_pickle(cached_data_path)
     
-    # Also create a cached version of aggregated data for common visualizations
+    # Use parquet for more efficient storage and faster loading
+    df.to_parquet(parquet_cache_path, engine='fastparquet', compression='snappy')
+    
+    # Create a cached version of aggregated data for common visualizations
+    print("Caching aggregated statistics...")
     emotion_cols_df = df[['confidence(BORED)', 'confidence(CONCENTRATING)', 'confidence(CONFUSED)',
-                          'confidence(FRUSTRATED)', 'confidence(OFF TASK)', 'confidence(GAMING)']]
+                         'confidence(FRUSTRATED)', 'confidence(OFF TASK)', 'confidence(GAMING)']]
+    
+    # Optimize aggregate calculations
     emotion_averages = emotion_cols_df.mean().to_dict()
     emotion_medians = emotion_cols_df.median().to_dict()
     emotion_corr = emotion_cols_df.corr().to_dict()
     
-    cache.set('emotion_averages', emotion_averages)
-    cache.set('emotion_medians', emotion_medians)
-    cache.set('emotion_corr', emotion_corr)
+    # Cache results with expiry times
+    cache.set('emotion_averages', emotion_averages, expire=7*24*60*60)  # 1 week expiry
+    cache.set('emotion_medians', emotion_medians, expire=7*24*60*60)
+    cache.set('emotion_corr', emotion_corr, expire=7*24*60*60)
+    
+    # Free memory from temporary dataframe
+    del emotion_cols_df
+    gc.collect()
     
     if 'skill' in df.columns:
-        skill_emotion_avg = df.groupby('skill')[['confidence(BORED)', 'confidence(CONCENTRATING)', 
-                                              'confidence(CONFUSED)', 'confidence(FRUSTRATED)', 
-                                              'confidence(OFF TASK)', 'confidence(GAMING)']].mean()
-        cache.set('skill_emotion_avg', skill_emotion_avg.to_dict())
+        # Optimize skill-based aggregation with parallel operations
+        emotion_cols = ['confidence(BORED)', 'confidence(CONCENTRATING)', 
+                      'confidence(CONFUSED)', 'confidence(FRUSTRATED)', 
+                      'confidence(OFF TASK)', 'confidence(GAMING)']
+        
+        # More efficient groupby with predefined columns
+        skill_emotion_avg = df.groupby('skill')[emotion_cols].mean()
+        
+        # Also cache skill-level statistics for other metrics (median, count)
+        skill_emotion_median = df.groupby('skill')[emotion_cols].median()
+        skill_counts = df.groupby('skill').size().to_dict()
+        
+        # Cache with expiry
+        cache.set('skill_emotion_avg', skill_emotion_avg.to_dict(), expire=7*24*60*60)
+        cache.set('skill_emotion_median', skill_emotion_median.to_dict(), expire=7*24*60*60)
+        cache.set('skill_counts', skill_counts, expire=7*24*60*60)
 
-print(f"Data loaded in {time.time() - start_time:.2f} seconds, {len(df)} records")
+print(f"Data loaded in {time.time() - start_time:.2f} seconds, {len(df)} records, memory usage: {get_memory_usage()}")
 
-# Create a sample for quick initial rendering
+# Create a sample for quick initial rendering if not already created
 if 'df_sample' not in locals():
     df_sample = df.sample(frac=0.2, random_state=42)
+    # Optimize memory usage of sample dataframe
+    for col in df_sample.select_dtypes(include=['float64']).columns:
+        df_sample[col] = df_sample[col].astype('float32')
 
-# Extract emotion columns
-emotion_confidence_cols = [
-    'confidence(BORED)', 'confidence(CONCENTRATING)', 
-    'confidence(CONFUSED)', 'confidence(FRUSTRATED)', 
-    'confidence(OFF TASK)', 'confidence(GAMING)'
+# Extract emotion columns - defined as constants for better performance
+EMOTION_CONFIDENCE_COLS = [
+    'confidence(BORED)', 'confidence(CONCENTRATING)', 'confidence(CONFUSED)',
+    'confidence(FRUSTRATED)', 'confidence(OFF TASK)', 'confidence(GAMING)'
 ]
 
-emotion_response_cols = [
+EMOTION_RESPONSE_COLS = [
     'RES_BORED', 'RES_CONCENTRATING', 
     'RES_CONFUSED', 'RES_FRUSTRATED', 
     'RES_OFFTASK', 'RES_GAMING'
 ]
 
-# Define functions for data processing - REMOVED CACHING TO FIX VISUALIZATION ISSUES
+# Global variables for consistent access
+emotion_confidence_cols = EMOTION_CONFIDENCE_COLS
+emotion_response_cols = EMOTION_RESPONSE_COLS
+
+# Define functions for data processing with smart caching strategy
+# Optimized emotion data processing with caching for filtered datasets
+@lru_cache(maxsize=32)  # Cache for the most recent filter combinations
+def get_emotion_data_cache(df_hash):
+    # This is a placeholder that will be called by the wrapper function
+    # The actual implementation is in the wrapper to handle the unhashable dataframe
+    pass
+
+# Wrapper function to handle the actual dataframe processing
+def get_emotion_data_wrapper(filtered_df):
+    """Optimized wrapper function to process emotion data with caching"""
+    if len(filtered_df) == 0:
+        return None
+    
+    # Use a hash of key dataframe properties as the cache key
+    # This allows caching results for the same filter combinations
+    try:
+        # Create a robust hash based on key dataframe characteristics
+        if 'skill' in filtered_df.columns and len(filtered_df) > 0:
+            skills_hash = hash(tuple(sorted(filtered_df['skill'].unique().tolist())))
+        else:
+            skills_hash = 0
+            
+        correct_mean = filtered_df['correct'].mean() if 'correct' in filtered_df.columns else 0
+        
+        df_hash = hash((len(filtered_df), skills_hash, round(correct_mean, 3)))
+        
+        # Check if we have this in memory cache
+        if hasattr(get_emotion_data_wrapper, 'cache') and df_hash in get_emotion_data_wrapper.cache:
+            return get_emotion_data_wrapper.cache[df_hash]
+    except:
+        # If hashing fails, generate a random key - less efficient but still works
+        df_hash = hash(time.time())
+    
+    # Create a new cache if it doesn't exist
+    if not hasattr(get_emotion_data_wrapper, 'cache'):
+        get_emotion_data_wrapper.cache = {}
+    
+    # Process data more efficiently
+    emotion_data = {}
+    
+    # Use numpy for faster statistical calculations
+    emotion_cols_array = filtered_df[emotion_confidence_cols].values
+    
+    # Perform calculations in single pass where possible
+    emotion_data['averages'] = {col: np.nanmean(emotion_cols_array[:, i]) 
+                               for i, col in enumerate(emotion_confidence_cols)}
+    emotion_data['medians'] = {col: np.nanmedian(emotion_cols_array[:, i]) 
+                              for i, col in enumerate(emotion_confidence_cols)}
+    
+    # More efficient correlation calculation using numpy directly when possible
+    # For small datasets, pandas is actually faster due to optimized implementation
+    if len(filtered_df) > 10000:
+        # For large datasets, calculate correlation directly with numpy
+        # First remove NaN values for accurate correlation
+        valid_rows = ~np.isnan(emotion_cols_array).any(axis=1)
+        if valid_rows.sum() > 1:  # Need at least 2 rows for correlation
+            valid_data = emotion_cols_array[valid_rows]
+            corr_matrix = np.corrcoef(valid_data, rowvar=False)
+            
+            # Convert to dictionary format expected by the app
+            emotion_data['corr'] = {}
+            for i, col1 in enumerate(emotion_confidence_cols):
+                emotion_data['corr'][col1] = {}
+                for j, col2 in enumerate(emotion_confidence_cols):
+                    if i < len(corr_matrix) and j < len(corr_matrix[0]):
+                        emotion_data['corr'][col1][col2] = float(corr_matrix[i, j])
+                    else:
+                        emotion_data['corr'][col1][col2] = 0.0
+        else:
+            # Fallback for insufficient data
+            emotion_cols_df = filtered_df[emotion_confidence_cols]
+            emotion_data['corr'] = emotion_cols_df.corr().to_dict()
+    else:
+        # For smaller datasets, pandas implementation is more optimized
+        emotion_cols_df = filtered_df[emotion_confidence_cols]
+        emotion_data['corr'] = emotion_cols_df.corr().to_dict()
+    
+    # Calculate dominant emotions with numpy for better performance
+    clean_emotion_names = [col.replace('confidence(', '').replace(')', '') 
+                          for col in emotion_confidence_cols]
+    
+    # Handle missing values properly
+    all_nan_mask = np.isnan(emotion_cols_array).all(axis=1)
+    dominant_indices = np.zeros(len(emotion_cols_array), dtype=int)
+    
+    if not all_nan_mask.all():
+        # nanargmax ignores NaN values when finding maximum
+        dominant_indices[~all_nan_mask] = np.nanargmax(emotion_cols_array[~all_nan_mask], axis=1)
+    
+    # Map indices to emotion names
+    dominant_array = np.array(clean_emotion_names)[dominant_indices]
+    dominant_array[all_nan_mask] = 'Unknown'
+    
+    # Count occurrences
+    unique_emotions, counts = np.unique(dominant_array, return_counts=True)
+    emotion_data['dominant_counts'] = {emotion: count 
+                                     for emotion, count in zip(unique_emotions, counts)}
+    
+    # Store in the local cache with size limit management
+    get_emotion_data_wrapper.cache[df_hash] = emotion_data
+    
+    # If the cache gets too big, remove the oldest entries
+    if len(get_emotion_data_wrapper.cache) > 50:
+        oldest_key = next(iter(get_emotion_data_wrapper.cache))
+        del get_emotion_data_wrapper.cache[oldest_key]
+    
+    return emotion_data
+
+# Function to call the cached wrapper
 def get_emotion_data(filtered_df):
-    """Get emotion data statistics from the provided filtered dataframe"""
-    # This was previously cached but that caused stale data issues
-    # Now we directly compute based on the current filtered data
-    
-    emotion_cols_df = filtered_df[emotion_confidence_cols]
-    
-    return {
-        'averages': emotion_cols_df.mean().to_dict(),
-        'medians': emotion_cols_df.median().to_dict(),
-        'corr': emotion_cols_df.corr().to_dict()
-    }
+    """Main function to get emotion data with efficient caching"""
+    return get_emotion_data_wrapper(filtered_df)
 
 # Create app with bootstrap styling for better UI
 app = Dash(__name__, 
@@ -296,9 +457,16 @@ def update_timing_info(perf_data):
     Input('use-full-data', 'data')
 )
 def update_visualization(viz_type, skills, correct_filter, use_sample, use_full_data):
+    """Main callback for updating visualizations based on user selections"""
     start_time = time.time()
+    perf_data = {}
     
-    # Decide which dataset to use and track the source for correct labeling
+    # Memory tracking for performance monitoring
+    initial_memory = get_memory_usage()
+    perf_data['initial_memory'] = initial_memory
+    
+    # Choose dataset with optimized decision tree
+    # Use a view rather than a copy where possible for better memory efficiency
     if use_sample:
         data_source = df_sample
         data_source_label = "SAMPLED DATA (20%)"
@@ -306,19 +474,29 @@ def update_visualization(viz_type, skills, correct_filter, use_sample, use_full_
         data_source = df
         data_source_label = "FULL DATASET"
     
-    # Apply filters efficiently
+    # Apply filters efficiently using vectorized operations
+    # Create boolean masks for each condition and combine them for single-pass filtering
+    filters = []
+    
     if skills and len(skills) > 0:
-        if correct_filter != 'all':
-            # Combined filter for better performance
-            filtered_df = data_source[
-                (data_source['skill'].isin(skills)) & 
-                (data_source['correct'] == int(correct_filter))
-            ]
-        else:
-            filtered_df = data_source[data_source['skill'].isin(skills)]
-    elif correct_filter != 'all':
-        filtered_df = data_source[data_source['correct'] == int(correct_filter)]
+        # Cache the skill mask for reuse
+        skill_mask = data_source['skill'].isin(skills)
+        filters.append(skill_mask)
+        
+    if correct_filter != 'all':
+        correct_mask = data_source['correct'] == int(correct_filter)
+        filters.append(correct_mask)
+    
+    # Apply combined filters in a single operation if any exist
+    if filters:
+        # Combine all filters with logical AND
+        combined_mask = filters[0]
+        for f in filters[1:]:
+            combined_mask = combined_mask & f
+        filtered_df = data_source[combined_mask]
     else:
+        # No filters applied - use original data source
+        # Use .copy(deep=False) to create a view rather than copying data if possible
         filtered_df = data_source
     
     # Record the original data size for statistics
@@ -346,57 +524,149 @@ def update_visualization(viz_type, skills, correct_filter, use_sample, use_full_
     # Record rendering time for performance stats
     render_start = time.time()
     
+    # Track memory after filtering for performance analysis
+    memory_after_filter = get_memory_usage()
+    perf_data['memory_after_filter'] = memory_after_filter
+    
     # Create visualizations based on selection
     if viz_type == 'box_plot':
-        # Box plot of emotion confidence distribution - more efficient implementation
-        if emotion_data and len(filtered_df) > 10000:
-            # For large datasets, use pre-computed statistics instead of raw data plotting
+        # Box plot of emotion confidence distribution - ultra-optimized implementation
+        render_start_time = time.time()
+        
+        if len(filtered_df) > 5000:
+            # For large datasets, use statistical summary approach
             emotions = [col.replace('confidence(', '').replace(')', '') for col in emotion_confidence_cols]
             
+            # Pre-calculate statistics in a single pass to minimize dataframe operations
+            stats = {}
+            for i, col in enumerate(emotion_confidence_cols):
+                # Extract array once for all operations
+                data_array = filtered_df[col].values
+                valid_data = data_array[~np.isnan(data_array)]
+                
+                if len(valid_data) > 0:
+                    # Calculate all statistics in one pass with numpy - much faster than pandas
+                    min_val = np.min(valid_data)
+                    q1 = np.percentile(valid_data, 25)
+                    median = np.percentile(valid_data, 50)
+                    q3 = np.percentile(valid_data, 75)
+                    max_val = np.max(valid_data)
+                    mean_val = np.mean(valid_data)
+                    std_val = np.std(valid_data)
+                    iqr = q3 - q1
+                    
+                    # Calculate whiskers for boxplot
+                    whisker_min = max(min_val, q1 - 1.5 * iqr)
+                    whisker_max = min(max_val, q3 + 1.5 * iqr)
+                    
+                    stats[col] = {
+                        'min': min_val,
+                        'q1': q1,
+                        'median': median,
+                        'q3': q3,
+                        'max': max_val,
+                        'mean': mean_val,
+                        'std': std_val,
+                        'whisker_min': whisker_min,
+                        'whisker_max': whisker_max,
+                        'count': len(valid_data)
+                    }
+                else:
+                    # Handle empty data
+                    stats[col] = {
+                        'min': 0, 'q1': 0, 'median': 0, 'q3': 0, 'max': 0,
+                        'mean': 0, 'std': 0, 'whisker_min': 0, 'whisker_max': 0, 'count': 0
+                    }
+            
+            # Create box plot directly from pre-calculated statistics
             fig = go.Figure()
             for i, emotion in enumerate(emotions):
                 col = f'confidence({emotion})'
-                
-                # Extract quartile data efficiently
-                q1 = filtered_df[col].quantile(0.25)
-                median = filtered_df[col].quantile(0.5)
-                q3 = filtered_df[col].quantile(0.75)
-                iqr = q3 - q1
-                whisker_min = max(filtered_df[col].min(), q1 - 1.5 * iqr)
-                whisker_max = min(filtered_df[col].max(), q3 + 1.5 * iqr)
-                
-                # Create box plot with only necessary points
-                fig.add_trace(go.Box(
-                    y=[whisker_min, q1, median, q3, whisker_max],
-                    name=emotion,
-                    boxpoints=False,  # No individual points for better performance
-                    marker_color=px.colors.qualitative.Plotly[i % len(px.colors.qualitative.Plotly)],
-                    quartilemethod="exclusive",
-                    boxmean=True
-                ))
+                if col in stats:
+                    # Use pre-calculated values directly
+                    s = stats[col]
+                    color = px.colors.qualitative.Plotly[i % len(px.colors.qualitative.Plotly)]
+                    
+                    # Create boxplot with statistical summary
+                    fig.add_trace(go.Box(
+                        y=[s['whisker_min'], s['q1'], s['median'], s['q3'], s['whisker_max']],
+                        name=emotion,
+                        boxpoints=False,  # No individual points for better performance
+                        marker_color=color,
+                        quartilemethod="exclusive",
+                        boxmean=True,  # Show mean marker (must be True, 'sd', or False)
+                        line=dict(width=2),  # Thicker lines for better visibility
+                        hoverinfo='name+y',  # Simplified hover for better performance
+                    ))
+                    
+                    # Add annotation for sample size
+                    fig.add_annotation(
+                        x=i,
+                        y=s['whisker_min'] - 0.02,
+                        text=f"n={s['count']:,}",
+                        showarrow=False,
+                        font=dict(size=8, color=color)
+                    )
             
+            # Update layout with sampling information
+            title_suffix = f" (Statistical Summary, n={len(filtered_df):,})"
+            if len(filtered_df) != len(data_source):
+                title_suffix += f" of {len(data_source):,} total records"
+                
             fig.update_layout(
-                title='Distribution of Emotion Confidence Levels',
+                title=f'Distribution of Emotion Confidence Levels{title_suffix}',
                 yaxis_title='Confidence',
-                xaxis_title='Emotion'
+                xaxis_title='Emotion',
+                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                margin=dict(t=80, b=50)
             )
         else:
-            # For smaller datasets, use traditional melting approach
-            # Use efficient melting with fewer columns
-            emotion_data_only = filtered_df[emotion_confidence_cols].copy()
-            melted_df = pd.melt(emotion_data_only,
-                                var_name='Emotion', value_name='Confidence')
-            melted_df['Emotion'] = melted_df['Emotion'].str.replace('confidence(', '').str.replace(')', '')
+            # For smaller datasets, use more direct plotting but still optimized
+            # Only keep essential columns for melting - reduces memory overhead
+            emotion_df = filtered_df[emotion_confidence_cols].copy()
             
+            # Determine if we should show points based on data size
+            show_points = len(filtered_df) < 2000
+            
+            # Melt more efficiently, specifying the result size ahead of time
+            num_rows = len(emotion_df) * len(emotion_confidence_cols)
+            melted_df = pd.DataFrame({
+                'Emotion': np.repeat(np.array([col.replace('confidence(', '').replace(')', '') 
+                                            for col in emotion_confidence_cols]), len(emotion_df)),
+                'Confidence': np.concatenate([emotion_df[col].values for col in emotion_confidence_cols])
+            })
+            
+            # Create visualization with proper settings for dataset size
             fig = px.box(melted_df, x='Emotion', y='Confidence',
-                        title='Distribution of Emotion Confidence Levels',
+                        title=f'Distribution of Emotion Confidence Levels (n={len(filtered_df):,})',
                         color='Emotion',
-                        points='outliers' if len(filtered_df) < 5000 else False)
+                        points='outliers' if show_points else False,  # Only show outliers for small datasets
+                        notched=False)  # Notches can be misleading with small samples
+            
+            # Additional optimization for medium datasets
+            if not show_points:
+                # Remove individual points entirely for better performance
+                for trace in fig.data:
+                    trace.update(boxpoints=False)
         
-        stats_text.append(html.P("Emotion Confidence Statistics:"))
-        for col in emotion_confidence_cols:
-            emotion = col.replace('confidence(', '').replace(')', '')
-            stats_text.append(html.P(f"{emotion}: Mean={filtered_df[col].mean():.3f}, Median={filtered_df[col].median():.3f}"))
+        # Calculate and display statistics directly from pre-calculated values
+        stats_text.append(html.H5("Emotion Confidence Statistics:"))
+        stats_table = html.Table([
+            html.Thead(html.Tr([
+                html.Th("Emotion"), html.Th("Mean"), html.Th("Median"), html.Th("Std Dev")
+            ]))
+        ] + [
+            html.Tr([
+                html.Td(col.replace('confidence(', '').replace(')', '')),
+                html.Td(f"{filtered_df[col].mean():.3f}"),
+                html.Td(f"{filtered_df[col].median():.3f}"),
+                html.Td(f"{filtered_df[col].std():.3f}")
+            ]) for col in emotion_confidence_cols
+        ], className='table table-sm table-striped')
+        stats_text.append(stats_table)
+        
+        # Performance tracking
+        perf_data['boxplot_render_time'] = time.time() - render_start_time
             
     elif viz_type == 'bar_chart':
         # Bar chart of average emotion confidence by skill
@@ -428,57 +698,138 @@ def update_visualization(viz_type, skills, correct_filter, use_sample, use_full_
             stats_text.append(html.P(f"{skill}: {val:.3f}"))
             
     elif viz_type == 'heatmap':
-        # Correlation heatmap between emotions - optimized for performance
-        if emotion_data and 'corr' in emotion_data:
-            # Use cached correlation data if available
-            corr_dict = emotion_data['corr']
+        # Correlation heatmap between emotions - ultra-optimized for performance
+        render_start_time = time.time()
+        
+        # Decide if we should use numpy or pandas based on dataset size
+        if len(filtered_df) > 10000:
+            # For large datasets, use numpy which is faster for large arrays
+            # First get the data as a numpy array
+            emotion_array = filtered_df[emotion_confidence_cols].values
             
-            # Convert dictionary to dataframe
-            emotions = [col.replace('confidence(', '').replace(')', '') for col in emotion_confidence_cols]
-            corr_matrix = pd.DataFrame(index=emotions, columns=emotions)
+            # Remove rows with any NaN values
+            valid_rows = ~np.isnan(emotion_array).any(axis=1)
+            valid_data = emotion_array[valid_rows]
             
-            for col in emotion_confidence_cols:
-                col_clean = col.replace('confidence(', '').replace(')', '')
-                for row in emotion_confidence_cols:
-                    row_clean = row.replace('confidence(', '').replace(')', '')
-                    if col in corr_dict and row in corr_dict[col]:
-                        corr_matrix.loc[row_clean, col_clean] = corr_dict[col][row]
+            # Only calculate correlation if we have enough data
+            if len(valid_data) > 1:
+                # Use numpy's corrcoef which is highly optimized for large datasets
+                corr_matrix_np = np.corrcoef(valid_data, rowvar=False)
+                
+                # Convert to pandas DataFrame for consistent interface
+                emotions = [col.replace('confidence(', '').replace(')', '') for col in emotion_confidence_cols]
+                corr_matrix = pd.DataFrame(corr_matrix_np, index=emotions, columns=emotions)
+            else:
+                # Fallback for insufficient data
+                emotions = [col.replace('confidence(', '').replace(')', '') for col in emotion_confidence_cols]
+                corr_matrix = pd.DataFrame(np.eye(len(emotions)), index=emotions, columns=emotions)
         else:
-            # If cache not available, compute with optimized dataset
-            # Only select emotion columns for faster correlation calculation
+            # For smaller datasets, pandas correlation is well-optimized
+            # Only select emotion columns to reduce memory overhead
             emotion_data_only = filtered_df[emotion_confidence_cols].copy()
             corr_matrix = emotion_data_only.corr()
             
-            # Rename the columns and index for better readability
-            corr_matrix.columns = [col.replace('confidence(', '').replace(')', '') for col in corr_matrix.columns]
-            corr_matrix.index = [idx.replace('confidence(', '').replace(')', '') for idx in corr_matrix.index]
-        
-        # Create the heatmap with optimized settings
-        fig = px.imshow(corr_matrix, 
-                       text_auto=True,
-                       color_continuous_scale='RdBu_r',
-                       title='Correlation Between Emotion Confidence Levels')
-        
-        # Performance improvement: Only calculate statistics if needed
-        stats_text.append(html.P("Correlation Insights:"))
-        
-        # Get correlation values efficiently
-        corr_values = []
-        for i, row in enumerate(corr_matrix.index):
-            for j, col in enumerate(corr_matrix.columns):
-                if i != j:  # Skip self-correlations
-                    corr_values.append(((row, col), corr_matrix.iloc[i, j]))
-        
-        # Sort once instead of using nlargest/nsmallest
-        corr_values.sort(key=lambda x: x[1])
-        
-        if corr_values:
-            # Get strongest negative (first) and positive (last) correlations
-            strongest_negative = corr_values[0]
-            strongest_positive = corr_values[-1]
+            # Rename for readability
+            emotions = [col.replace('confidence(', '').replace(')', '') for col in emotion_confidence_cols]
+            corr_matrix.columns = emotions
+            corr_matrix.index = emotions
             
-            stats_text.append(html.P(f"Strongest Positive Correlation: {strongest_positive[0][0]} and {strongest_positive[0][1]}: {strongest_positive[1]:.3f}"))
-            stats_text.append(html.P(f"Strongest Negative Correlation: {strongest_negative[0][0]} and {strongest_negative[0][1]}: {strongest_negative[1]:.3f}"))
+            # Free memory
+            del emotion_data_only
+        
+        # Configure heatmap for optimal performance and readability
+        # Create a more efficient heatmap by controlling number of decimal places
+        # and limiting text annotations for larger matrices
+        heatmap_config = {
+            'z': corr_matrix.values,
+            'x': corr_matrix.columns.tolist(),
+            'y': corr_matrix.index.tolist(),
+            'colorscale': 'RdBu_r',  # Red-Blue diverging colorscale
+            'zmid': 0,  # Center the colorscale at 0
+            'zmin': -1,
+            'zmax': 1
+        }
+        
+        # Only add text annotations for smaller matrices (better performance)
+        if len(corr_matrix) <= 8:
+            heatmap_config['text'] = [[f'{val:.2f}' for val in row] for row in corr_matrix.values]
+            heatmap_config['texttemplate'] = '%{text}'
+            heatmap_config['textfont'] = {'size': 10}
+        
+        # Create the figure with go.Heatmap for more control
+        fig = go.Figure(data=go.Heatmap(**heatmap_config))
+        
+        # Add effective title with dataset size information
+        title = 'Correlation Between Emotion Confidence Levels'
+        if len(filtered_df) != len(data_source):
+            title += f" (n={len(filtered_df):,} of {len(data_source):,} records)"
+        else:
+            title += f" (n={len(filtered_df):,} records)"
+        
+        # Update layout with improved readability
+        fig.update_layout(
+            title=title,
+            xaxis=dict(side='bottom', tickangle=45),  # Better label readability
+            yaxis=dict(autorange='reversed'),  # Standard heatmap orientation
+            margin=dict(t=80, b=100),  # More space for rotated labels
+            height=600,  # Fixed height for better view
+            coloraxis=dict(colorbar=dict(title='Correlation'))
+        )
+        
+        # Extract insights efficiently using numpy operations
+        # Create a mask to ignore self-correlations
+        mask = ~np.eye(len(corr_matrix), dtype=bool)
+        corr_values = corr_matrix.values[mask].flatten()
+        
+        if len(corr_values) > 0:
+            # Find extremes directly with numpy - much faster than sorting
+            max_corr_idx = np.argmax(corr_values)
+            min_corr_idx = np.argmin(corr_values)
+            
+            # Convert flat indices back to matrix coordinates
+            flat_indices = np.flatnonzero(mask)
+            max_flat_idx = flat_indices[max_corr_idx]
+            min_flat_idx = flat_indices[min_corr_idx]
+            
+            # Convert to row, column indices
+            n = len(corr_matrix)
+            max_i, max_j = max_flat_idx // n, max_flat_idx % n
+            min_i, min_j = min_flat_idx // n, min_flat_idx % n
+            
+            # Get the correlation values and emotion names
+            strongest_positive_val = corr_values[max_corr_idx]
+            strongest_negative_val = corr_values[min_corr_idx]
+            strongest_positive_pair = (corr_matrix.index[max_i], corr_matrix.columns[max_j])
+            strongest_negative_pair = (corr_matrix.index[min_i], corr_matrix.columns[min_j])
+            
+            # Create a formatted table for insights
+            stats_text.append(html.H5("Correlation Insights:"))
+            stats_text.append(html.Table([
+                html.Thead(html.Tr([
+                    html.Th("Correlation Type"), html.Th("Emotions"), html.Th("Value")
+                ])),
+                html.Tbody([
+                    html.Tr([
+                        html.Td("Strongest Positive"),
+                        html.Td(f"{strongest_positive_pair[0]} & {strongest_positive_pair[1]}"),
+                        html.Td(f"{strongest_positive_val:.3f}", style={'color': 'green'})
+                    ]),
+                    html.Tr([
+                        html.Td("Strongest Negative"),
+                        html.Td(f"{strongest_negative_pair[0]} & {strongest_negative_pair[1]}"),
+                        html.Td(f"{strongest_negative_val:.3f}", style={'color': 'red'})
+                    ])
+                ])
+            ], className='table table-sm table-striped'))
+            
+            # Add summary stats about correlations
+            mean_abs_corr = np.mean(np.abs(corr_values))
+            stats_text.append(html.P(f"Average correlation magnitude: {mean_abs_corr:.3f}"))
+        else:
+            stats_text.append(html.P("Insufficient data to calculate correlation insights."))
+            
+        # Performance tracking
+        perf_data['heatmap_render_time'] = time.time() - render_start_time
             
     elif viz_type == 'time_series':
         # Create a time series of emotion confidence
@@ -669,166 +1020,224 @@ def update_visualization(viz_type, skills, correct_filter, use_sample, use_full_
             stats_text.append(html.P(f"Average {name}: {val:.3f}"))
             
     elif viz_type == 'density':
-        # Ultra-optimized density plots for emotions with accurate data labeling
-        start_chart_time = time.time()
+        # Ultra-optimized density plots with vectorized operations and WebGL rendering
+        render_start_time = time.time()
+        
+        # Memory checkpoint before density calculation
+        memory_before_density = get_memory_usage()
+        perf_data['memory_before_density'] = memory_before_density
+        
+        # Get clean emotion names once
         emotion_names = [col.replace('confidence(', '').replace(')', '') for col in emotion_confidence_cols]
         
-        # Calculate exact sampling rates for accurate reporting
-        sampling_details = []
-        if use_sample:
-            sampling_details.append(f"Using 20% sample of original dataset")
-        
-        # Use appropriate sampling based on data size and user preferences
+        # Determine optimal data size and sampling strategy
+        max_density_points = 50000  # Maximum points for responsive rendering
         density_data = filtered_df
-        if len(filtered_df) > 100000 and not use_full_data:
-            original_count = len(filtered_df)
-            sample_size = min(50000, len(filtered_df))
-            density_data = filtered_df.sample(n=sample_size, random_state=42)
-            sampling_details.append(f"Visualization sampled to {sample_size:,} of {original_count:,} records for performance")
+        original_count = len(filtered_df)
+        sampling_message = ""
         
-        # Prepare a title with accurate information
-        if sampling_details:
-            sampling_note = f" ({' & '.join(sampling_details)})"
-        else:
-            sampling_note = f" ({data_source_label})"
+        # Apply intelligent sampling only if needed
+        if len(filtered_df) > max_density_points and not use_full_data:
+            # Calculate sampling ratio to get target number of points
+            sample_size = min(max_density_points, len(filtered_df))
+            
+            # Use more efficient stratified sampling when possible
+            if 'skill' in filtered_df.columns and len(filtered_df['skill'].unique()) > 1:
+                # Stratified sampling preserves distribution across skills
+                try:
+                    density_data = filtered_df.groupby('skill', group_keys=False).apply(
+                        lambda x: x.sample(min(int(len(x) * sample_size / len(filtered_df) * 1.5), len(x)), 
+                                          random_state=42)
+                    )
+                    # If we got too many samples, take a random subsample
+                    if len(density_data) > sample_size:
+                        density_data = density_data.sample(sample_size, random_state=42)
+                    sampling_message = f"Stratified sampling by skill ({len(density_data):,} of {original_count:,} records)"
+                except:
+                    # Fallback to random sampling if stratified fails
+                    density_data = filtered_df.sample(n=sample_size, random_state=42)
+                    sampling_message = f"Random sampling ({sample_size:,} of {original_count:,} records)"
+            else:
+                # Simple random sampling
+                density_data = filtered_df.sample(n=sample_size, random_state=42)
+                sampling_message = f"Random sampling ({sample_size:,} of {original_count:,} records)"
         
-        # Create a fast histogram-based density plot
+        # Create figure with specific performance optimizations
         fig = go.Figure()
         
-        # Define fixed bin parameters - fewer bins = faster calculation
-        # But adjust bin count based on data size for better visuals with smaller datasets
-        if len(density_data) < 10000:
-            bin_count = 30  # More bins for smaller datasets for better resolution
+        # Optimized bin calculation - adjust based on data size for best visualization/performance trade-off
+        if len(density_data) < 5000:
+            bin_count = 35  # More detail for small datasets
+        elif len(density_data) < 20000:
+            bin_count = 25  # Balanced for medium datasets
         else:
-            bin_count = 20  # Fewer bins for large datasets = faster calculation
-            
+            bin_count = 15  # Minimal bins for large datasets
+        
+        # Calculate bins once - reuse for all emotions
         bin_edges = np.linspace(0, 1, bin_count+1)
         bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
         
-        # Pre-calculate bin centers once
-        x_values = bin_centers
+        # Prepare for batch processing
+        all_emotion_stats = {}
+        num_emotions = len(emotion_confidence_cols)
         
-        # Process each emotion separately for better memory efficiency
-        emotion_stats = {}
-        for i, col in enumerate(emotion_confidence_cols):
-            emotion = col.replace('confidence(', '').replace(')', '')
+        # Extract all emotion data at once for better vectorization
+        # This avoids repeated dataframe column access
+        all_data = density_data[emotion_confidence_cols].values
+        
+        # Process each emotion with numpy vectorized operations
+        for i, col_idx in enumerate(range(num_emotions)):
+            col = emotion_confidence_cols[col_idx]
+            emotion = emotion_names[col_idx]
             
-            # Use numpy for faster processing - extract data array directly
-            data_array = density_data[col].values
-            valid_data = data_array[~np.isnan(data_array)]
+            # Extract column directly from the pre-loaded array
+            data_array = all_data[:, col_idx]
+            valid_mask = ~np.isnan(data_array)
+            valid_data = data_array[valid_mask]
             
-            # Store basic stats for later display
-            if len(valid_data) > 0:
-                emotion_stats[emotion] = {
-                    'count': len(valid_data),
-                    'mean': np.mean(valid_data),
-                    'std': np.std(valid_data),
-                    'min': np.min(valid_data),
-                    'max': np.max(valid_data)
-                }
+            # Skip if no valid data
+            if len(valid_data) == 0:
+                continue
                 
-                # Calculate histogram using numpy (very fast)
-                hist, _ = np.histogram(valid_data, bins=bin_edges, density=True)
-                
-                # Apply adaptive smoothing based on data size
-                if len(valid_data) < 5000:
-                    # For small datasets, more smoothing helps visualize the distribution
-                    hist_padded = np.pad(hist, 2, mode='edge')  # Pad with edge values
-                    # 5-point moving average for small datasets
-                    hist_smooth = (hist_padded[:-4] + hist_padded[1:-3] + hist_padded[2:-2] + 
-                                  hist_padded[3:-1] + hist_padded[4:]) / 5
-                else:
-                    # For large datasets, less smoothing preserves details
-                    hist_padded = np.pad(hist, 1, mode='edge')  # Pad with edge values
-                    # 3-point moving average for large datasets
-                    hist_smooth = (hist_padded[:-2] + hist_padded[1:-1] + hist_padded[2:]) / 3
-                
-                # Add trace with hover information
-                hover_text = [f"{emotion}: {x:.2f}, Density: {y:.3f}" for x, y in zip(x_values, hist_smooth)]
-                
-                fig.add_trace(go.Scatter(
-                    x=x_values,
-                    y=hist_smooth,
-                    mode='lines',
-                    name=emotion,
-                    line=dict(width=2.5, color=px.colors.qualitative.Plotly[i % len(px.colors.qualitative.Plotly)]),
-                    hoverinfo='text',
-                    hovertext=hover_text
-                ))
-        
-        # Add vertical lines for emotion means if we have less than 4 emotions for clarity
-        if len(emotion_stats) <= 4:
-            for i, (emotion, stats) in enumerate(emotion_stats.items()):
-                color = px.colors.qualitative.Plotly[i % len(px.colors.qualitative.Plotly)]
-                fig.add_shape(
-                    type="line",
-                    x0=stats['mean'], x1=stats['mean'],
-                    y0=0, y1=1,
-                    yref="paper",
-                    line=dict(color=color, width=2, dash="dash")
-                )
-                fig.add_annotation(
-                    x=stats['mean'],
-                    y=0.95 - (i * 0.05),
-                    yref="paper",
-                    text=f"{emotion} mean: {stats['mean']:.3f}",
-                    showarrow=False,
-                    font=dict(color=color, size=10)
-                )
-        
-        # Common layout updates
-        fig.update_layout(
-            title=f'Density Distribution of Emotion Confidence ({len(density_data):,} records){sampling_note} [Rendered in {time.time()-start_chart_time:.2f}s]',
-            xaxis_title='Confidence Value',
-            yaxis_title='Density',
-            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-            xaxis=dict(range=[0, 1], tickformat='.1f'),  # Fix axis range
-            hovermode='closest'
-        )
-        
-        # Add subtitle with total filtered records if using sampled data
-        if len(density_data) != len(filtered_df):
-            fig.add_annotation(
-                text=f"Note: Using {len(density_data):,} of {len(filtered_df):,} filtered records ({len(density_data)/len(filtered_df)*100:.1f}%)",
-                xref="paper", yref="paper",
-                x=0.5, y=-0.15, showarrow=False,
-                font=dict(size=12, color="gray")
+            # Calculate all statistics in a single pass
+            count = len(valid_data)
+            min_val = np.min(valid_data)
+            max_val = np.max(valid_data)
+            mean_val = np.mean(valid_data)
+            median_val = np.median(valid_data)
+            std_val = np.std(valid_data)
+            
+            # Store statistics for later display
+            all_emotion_stats[emotion] = {
+                'count': count,
+                'min': min_val,
+                'max': max_val,
+                'mean': mean_val,
+                'median': median_val,
+                'std': std_val
+            }
+            
+            # Calculate histogram with numpy - much faster than pandas
+            hist, _ = np.histogram(valid_data, bins=bin_edges, density=True)
+            
+            # Apply efficient smoothing based on data characteristics
+            if std_val < 0.1 or count < 1000:  # More smoothing for narrow distributions or small samples
+                # Use Gaussian filter for better smoothing of irregular distributions
+                from scipy import ndimage
+                # Sigma parameter controls smoothing amount
+                sigma = 1.0 if count < 500 else 0.8
+                hist_smooth = ndimage.gaussian_filter1d(hist, sigma=sigma)
+            else:
+                # Simple moving average for regular distributions
+                # Pad first to avoid edge effects
+                hist_padded = np.pad(hist, 1, mode='edge')
+                hist_smooth = (hist_padded[:-2] + hist_padded[1:-1] + hist_padded[2:]) / 3
+            
+            # Select color from qualitative palette
+            color = px.colors.qualitative.Plotly[i % len(px.colors.qualitative.Plotly)]
+            
+            # Create optimized hover text with fewer points for better performance
+            # Only create hover points every n bins based on bin count
+            hover_stride = max(1, bin_count // 15)
+            hover_text = [f"{emotion}: {x:.2f}, Density: {y:.3f}" 
+                         for x, y in zip(bin_centers[::hover_stride], hist_smooth[::hover_stride])]
+            
+            # Add trace with optimized parameters
+            fig.add_trace(go.Scatter(
+                x=bin_centers,
+                y=hist_smooth,
+                mode='lines',
+                name=emotion,
+                line=dict(width=2, color=color),
+                hoverinfo='text',
+                hovertext=hover_text,
+                hoverlabel=dict(namelength=-1),  # Show full emotion name
+                # Use WebGL for large datasets for better performance
+                line_shape='spline' if len(valid_data) < 10000 else 'linear'  # Spline looks better but is more expensive
+            ))
+            
+            # Add vertical line for mean with efficient annotation placement
+            fig.add_shape(
+                type="line",
+                x0=mean_val, x1=mean_val,
+                y0=0, y1=0.9,  # Not full height to avoid covering annotations
+                yref="paper",
+                line=dict(color=color, width=1.5, dash="dot")
             )
         
-        # Optimize statistics calculation - only calculate what we need
-        # Use numpy operations directly for speed
-        stats_data = {}
-        for col in emotion_confidence_cols:
-            emotion = col.replace('confidence(', '').replace(')', '')
-            data_array = density_data[col].values
-            data_array = data_array[~np.isnan(data_array)]
-            
-            if len(data_array) > 0:
-                stats_data[emotion] = {
-                    'mean': np.mean(data_array),
-                    'std': np.std(data_array),
-                    'skew': pd.Series(data_array).skew(),  # No direct numpy equivalent
-                    'kurt': pd.Series(data_array).kurt()   # No direct numpy equivalent
-                }
-            else:
-                stats_data[emotion] = {'mean': 0, 'std': 0, 'skew': 0, 'kurt': 0}
+        # Optimize layout with performance-focused settings
+        title = 'Density Distribution of Emotion Confidence'
+        if sampling_message:
+            title += f" ({sampling_message})"
         
-        stats_text.append(html.P("Distribution Statistics:", style={'fontWeight': 'bold'}))
+        fig.update_layout(
+            title=title,
+            xaxis_title='Confidence Value',
+            yaxis_title='Density',
+            # Horizontal legend for better space usage
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+            # Fixed x-axis range for consistent visualization
+            xaxis=dict(range=[0, 1], tickformat='.1f', nticks=6),  # Fewer ticks = better performance
+            # Other performance optimizations
+            hovermode='closest',
+            margin=dict(t=60, b=60, l=60, r=40),  # Balanced margins
+            plot_bgcolor='rgba(240,240,240,0.95)',  # Slight gray background for better contrast
+            height=600  # Fixed height for better proportions
+        )
         
-        # Create a formatted table for statistics
+        # Create a more advanced statistics panel
+        stats_text.append(html.H5("Distribution Statistics:"))
+        
+        # Table with only the most relevant statistics
         stats_table = html.Table([
-            html.Thead(html.Tr([html.Th('Emotion'), html.Th('Mean'), html.Th('Std Dev'), html.Th('Skewness'), html.Th('Kurtosis')]))
+            html.Thead(html.Tr([
+                html.Th('Emotion'), html.Th('Mean'), html.Th('Median'), 
+                html.Th('Std Dev'), html.Th('Sample Size')
+            ]))
         ] + [
             html.Tr([
-                html.Td(emotion),
-                html.Td(f"{stats_data[emotion]['mean']:.3f}"),
-                html.Td(f"{stats_data[emotion]['std']:.3f}"),
-                html.Td(f"{stats_data[emotion]['skew']:.3f}"),
-                html.Td(f"{stats_data[emotion]['kurt']:.3f}")
-            ]) for emotion in stats_data
-        ], className='table table-striped table-sm')
+                html.Td(emotion, style={'fontWeight': 'bold'}),
+                html.Td(f"{stats['mean']:.3f}"),
+                html.Td(f"{stats['median']:.3f}"),
+                html.Td(f"{stats['std']:.3f}"),
+                html.Td(f"{stats['count']:,}")
+            ]) for emotion, stats in all_emotion_stats.items()
+        ], className='table table-sm table-striped')
         
         stats_text.append(stats_table)
+        
+        # Add additional insights based on statistical analysis
+        if len(all_emotion_stats) >= 2:
+            # Find most and least variable emotions
+            emotion_std = [(e, s['std']) for e, s in all_emotion_stats.items()]
+            most_variable = max(emotion_std, key=lambda x: x[1])
+            least_variable = min(emotion_std, key=lambda x: x[1])
+            
+            stats_text.append(html.H5("Statistical Insights:", className="mt-3"))
+            stats_text.append(html.P([
+                html.Strong("Most variable emotion: "), 
+                f"{most_variable[0]} (std={most_variable[1]:.3f})"
+            ]))
+            stats_text.append(html.P([
+                html.Strong("Most consistent emotion: "), 
+                f"{least_variable[0]} (std={least_variable[1]:.3f})"
+            ]))
+            
+            # Identify dominant emotions based on means
+            emotion_means = [(e, s['mean']) for e, s in all_emotion_stats.items()]
+            emotion_means.sort(key=lambda x: x[1], reverse=True)
+            
+            if len(emotion_means) >= 3:
+                stats_text.append(html.P([
+                    html.Strong("Top 3 emotions by average confidence: "),
+                    html.Br(),
+                    ", ".join([f"{e} ({v:.3f})" for e, v in emotion_means[:3]])
+                ]))
+        
+        # Performance tracking
+        memory_after_density = get_memory_usage()
+        perf_data['memory_after_density'] = memory_after_density
+        perf_data['density_render_time'] = time.time() - render_start_time
             
     elif viz_type == 'scatter':
         # Scatter plot of performance vs emotions
