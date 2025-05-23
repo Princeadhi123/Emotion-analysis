@@ -1,0 +1,6 @@
+pandas
+plotly
+dash
+numpy
+diskcache
+dash-bootstrap-components
